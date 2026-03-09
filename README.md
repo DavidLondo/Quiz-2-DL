@@ -16,6 +16,31 @@
 
 ---
 
+### Decisiones de diseño del pipeline
+
+Adaptar el esquema del notebook de referencia (VGG16 + frutas) al dataset de
+Sign Language MNIST requirió tres ajustes técnicos no triviales:
+
+- **Grayscale → pseudo-RGB:** ResNet18 espera tensores de 3 canales. Las imágenes
+  del dataset son monocromáticas (1 canal), por lo que se replica el canal único
+  tres veces (`img.repeat(3, 1, 1)`). Esto no añade información nueva, pero
+  satisface la interfaz de la arquitectura sin alterar los pesos preentrenados.
+
+- **Resolución 64×64 en lugar de 224×224:** ResNet fue entrenado con imágenes de
+  224×224. Sin embargo, las imágenes originales son de 28×28 píxeles — escalar
+  directamente a 224×224 introduce artefactos severos de interpolación sobre
+  imágenes que originalmente tienen muy poca resolución. Se eligió 64×64 como
+  compromiso: suficiente para que la red extraiga features espaciales sin
+  distorsión extrema, y manejable en CPU sin cambiar la lógica del pipeline.
+
+- **Remap de etiquetas:** Las etiquetas originales van de 0 a 24 saltando el 9
+  (letra J, excluida por requerir movimiento). PyTorch espera índices contiguos
+  de 0 a N-1 para `CrossEntropyLoss`. Se construye un mapa `{0:0, ..., 8:8,
+  10:9, ..., 24:23}` que convierte las 24 etiquetas no contiguas al rango
+  continuo `[0, 23]`.
+
+---
+
 ## Modelos evaluados
 
 | # | Modelo | Arquitectura | Paráms entrenables | Épocas |
@@ -34,10 +59,17 @@
 | Exp1 — Solo última capa | 95.56 % | 96.47 % | **79.32 %** |
 | Exp2 — Fine-Tuning (FaseB) | 99.64 % | 99.80 % | **96.57 %** |
 
-**Baseline CNN:** Existe un gap pronunciado entre train (79%) y val (99%).
-Esto se explica porque el train usa data augmentation (flip + rotación), lo que hace
-las imágenes de entrenamiento más difíciles. El modelo generaliza bien en validación
-pero cae a 91% en test, evidenciando cierta diferencia de distribución entre splits.
+**Baseline CNN:** El modelo muestra 79.33% de train accuracy y 99.07% de val accuracy, lo cual
+parece contradictorio: normalmente se espera que el modelo rinda mejor en train
+que en val. La explicación está en el data augmentation: las transformaciones
+de flip horizontal y rotación aleatoria se aplican **únicamente al conjunto de
+entrenamiento**. Esto hace que cada imagen de train que ve el modelo durante
+el forward pass sea una versión alterada y más difícil de la original, mientras
+que la validación recibe imágenes limpias sin transformar. El modelo aprende a
+generalizar bien precisamente porque entrenó con versiones difíciles, pero su
+accuracy de train medido sobre esas mismas versiones difíciles es artificialmente
+bajo. No es overfitting inverso — es el efecto esperado de un augmentation bien
+aplicado.
 
 **Experimento 1:** Train y val convergen de forma muy estable y cercana (~95–96%),
 sin señales de overfitting. La brecha train/val es la más pequeña de los tres modelos.
@@ -62,6 +94,23 @@ el mejor de los tres.
 | Riesgo de overfitting | Moderado | Muy bajo | Bajo |
 | Adaptación al dominio | Total | Ninguna | Alta (layer4 entrenado) |
 | Test Accuracy | 91.01 % | 79.32 % ❌ | 96.57 % ✅ |
+
+¿Por qué ResNet18 y no VGG16?
+
+El notebook de referencia usa VGG16 (~138 M parámetros). Se eligió ResNet18
+(~11 M parámetros) por dos razones técnicas:
+
+1. **Eficiencia computacional:** una diferencia de 12× en parámetros es
+   significativa al entrenar en CPU. ResNet18 permite completar los experimentos
+   en tiempos razonables sin sacrificar la capacidad de representación necesaria
+   para este dataset.
+
+2. **Estabilidad del fine-tuning:** ResNet usa conexiones residuales (skip
+   connections) que permiten que el gradiente fluya directamente desde capas
+   profundas hacia capas tempranas sin degradarse. Esto hace que descongelar
+   `layer4` durante el fine-tuning sea más estable que hacerlo en VGG16, donde
+   los gradientes deben atravesar secuencias largas de capas sin atajos y son
+   más propensos a desvanecerse o explotar.
 
 El Transfer Learning **sin** fine-tuning (Exp1) fue **peor** que la CNN propia
 (79% vs 91% en test). El dominio de Sign Language MNIST es muy diferente al de
@@ -122,6 +171,40 @@ El gap val→test es el indicador más importante: 17 puntos en Exp1 vs solo 3 p
 en Exp2, lo que confirma que el fine-tuning produce un modelo que generaliza
 genuinamente al dominio del problema, mientras que el backbone congelado
 "memoriza" un mapeo frágil desde features inapropiadas.
+
+---
+
+## El gap val→test como indicador de generalización real
+
+La comparación de val accuracy entre modelos puede ser engañosa. Exp1 alcanza
+96.47% de val accuracy — un número que podría parecer satisfactorio — pero su
+test accuracy cae a 79.32%, un gap de **−17.15 puntos porcentuales**. Exp2
+tiene 99.80% de val accuracy y 96.57% de test accuracy, un gap de solo
+**−3.23 puntos**.
+
+| Modelo | Val Acc | Test Acc | Gap val→test |
+|--------|---------|----------|-------------|
+| Baseline CNN | 99.07 % | 91.01 % | −8.06 pp |
+| Exp1 — solo fc | 96.47 % | 79.32 % | **−17.15 pp** |
+| Exp2 — fine-tuning | 99.80 % | 96.57 % | −3.23 pp |
+
+Este gap mide qué tan frágil es la generalización del modelo. En Exp1, el
+backbone congelado aprende a mapear features de ImageNet hacia las 24 clases
+de signos, pero ese mapeo depende de que los inputs de train y val provengan
+de la misma distribución interna del dataset. Cuando el modelo se evalúa
+sobre el conjunto de test — una partición diferente con posibles variaciones
+de iluminación, posición de mano o contraste — el mapeo aprendido sobre
+features inadecuadas se rompe con mayor facilidad.
+
+En Exp2, `layer4` ajusta sus filtros para capturar características realmente
+relevantes para el dominio (bordes de dedos, orientaciones de mano, contornos
+de gestos). Esas representaciones son más robustas ante variaciones de
+distribución entre splits, lo que se refleja en un gap pequeño y estable.
+
+**Conclusión práctica:** al comparar modelos de Transfer Learning, el gap
+val→test es más informativo que la val accuracy aislada. Un gap grande indica
+que el modelo está explotando patrones específicos de la partición de validación
+pero no ha aprendido representaciones genuinamente transferibles al problema.
 
 ---
 
